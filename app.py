@@ -1,28 +1,24 @@
 """
 QuanBench Live Demo
 ====================
-Streamlit app: natural language → Qiskit circuit → visualization + evaluation.
+Streamlit app: natural language -> Qiskit circuit -> visualization + evaluation.
 
 Run locally:
     streamlit run app.py
-
-Deploy on Streamlit Cloud:
-    Push to GitHub, connect repo at share.streamlit.io
 """
 
 import os
 import io
+import re
+import json
 import time
-import textwrap
 import traceback
 from datetime import datetime, timedelta
-from collections import defaultdict
 
 import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 
 from qiskit import QuantumCircuit, transpile
@@ -37,134 +33,81 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── API key — read from secrets OR env, never at module load ──────────────────
+def get_api_key() -> str:
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return os.environ.get("ANTHROPIC_API_KEY", "")
+
 # ── styling ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'JetBrains Mono', monospace;
-}
-.main { background: #04070f; }
+html, body, [class*="css"] { font-family: 'JetBrains Mono', monospace; }
 h1, h2, h3 { font-family: 'Syne', sans-serif !important; }
-
-.metric-card {
-    background: #0c1424;
-    border: 1px solid #162035;
-    border-radius: 12px;
-    padding: 16px 20px;
-    text-align: center;
-}
 .pass-badge {
-    background: #4ade8022;
-    color: #4ade80;
-    border: 1px solid #4ade8044;
-    border-radius: 999px;
-    padding: 3px 14px;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 1px;
+    background:#4ade8022; color:#4ade80; border:1px solid #4ade8044;
+    border-radius:999px; padding:3px 14px; font-size:12px; font-weight:700; letter-spacing:1px;
 }
 .fail-badge {
-    background: #f8717122;
-    color: #f87171;
-    border: 1px solid #f8717144;
-    border-radius: 999px;
-    padding: 3px 14px;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 1px;
+    background:#f8717122; color:#f87171; border:1px solid #f8717144;
+    border-radius:999px; padding:3px 14px; font-size:12px; font-weight:700; letter-spacing:1px;
 }
 .info-box {
-    background: #22d3ee0a;
-    border: 1px solid #22d3ee25;
-    border-radius: 10px;
-    padding: 14px 18px;
-    margin: 10px 0;
+    background:#22d3ee0a; border:1px solid #22d3ee25;
+    border-radius:10px; padding:14px 18px; margin:10px 0;
 }
 .warn-box {
-    background: #fbbf2408;
-    border: 1px solid #fbbf2430;
-    border-radius: 10px;
-    padding: 14px 18px;
-    margin: 10px 0;
+    background:#fbbf2408; border:1px solid #fbbf2430;
+    border-radius:10px; padding:14px 18px; margin:10px 0;
 }
 .stTextArea textarea {
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 13px !important;
-    background: #080d1a !important;
-    border: 1px solid #162035 !important;
-    color: #cbd5e1 !important;
+    font-family:'JetBrains Mono', monospace !important; font-size:13px !important;
+    background:#080d1a !important; border:1px solid #162035 !important; color:#cbd5e1 !important;
 }
 .stButton > button {
-    background: linear-gradient(135deg, #22d3ee, #a78bfa);
-    color: #04070f;
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 700;
-    font-size: 13px;
-    letter-spacing: 1px;
-    border: none;
-    border-radius: 8px;
-    padding: 10px 28px;
-    width: 100%;
-}
-.stButton > button:hover {
-    opacity: 0.9;
-    transform: translateY(-1px);
-}
-code {
-    background: #0c1424 !important;
-    color: #22d3ee !important;
-    border-radius: 4px;
-    padding: 1px 6px;
-    font-size: 12px;
+    background:linear-gradient(135deg, #22d3ee, #a78bfa); color:#04070f;
+    font-family:'JetBrains Mono', monospace; font-weight:700; font-size:13px;
+    letter-spacing:1px; border:none; border-radius:8px; padding:10px 28px; width:100%;
 }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ── rate limiter ───────────────────────────────────────────────────────────────
-# Simple in-memory rate limiter: max N runs per hour globally
-RATE_LIMIT_MAX  = 20       # max runs per hour globally
-RATE_LIMIT_SECS = 3600     # 1 hour window
+# ── rate limiter (global, session-based) ──────────────────────────────────────
+RATE_LIMIT_MAX  = 20
+RATE_LIMIT_SECS = 3600
 
 if "rate_log" not in st.session_state:
-    st.session_state.rate_log = []   # list of timestamps
+    st.session_state.rate_log = []
 
-def _check_rate_limit() -> tuple[bool, int]:
-    """Returns (allowed, remaining_runs)."""
+def _check_rate_limit():
     now = datetime.utcnow()
     cutoff = now - timedelta(seconds=RATE_LIMIT_SECS)
-    st.session_state.rate_log = [
-        t for t in st.session_state.rate_log if t > cutoff
-    ]
-    used = len(st.session_state.rate_log)
-    remaining = RATE_LIMIT_MAX - used
+    st.session_state.rate_log = [t for t in st.session_state.rate_log if t > cutoff]
+    remaining = RATE_LIMIT_MAX - len(st.session_state.rate_log)
     return remaining > 0, remaining
 
 def _record_run():
     st.session_state.rate_log.append(datetime.utcnow())
 
-
 # ── Qiskit helpers ─────────────────────────────────────────────────────────────
-SIM = AerSimulator()
 SHOTS = 4096
 
 def run_circuit(qc: QuantumCircuit, shots: int = SHOTS) -> dict:
-    t = transpile(qc, SIM)
-    return SIM.run(t, shots=shots).result().get_counts()
+    sim = AerSimulator()
+    t = transpile(qc, sim)
+    return sim.run(t, shots=shots).result().get_counts()
 
 def circuit_png(qc: QuantumCircuit) -> bytes:
     fig = qc.draw("mpl", style="bw", fold=40)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=130,
-                facecolor="#080d1a")
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=130, facecolor="#080d1a")
     plt.close("all")
     buf.seek(0)
     return buf.read()
 
 def histogram_png(counts: dict, title: str = "") -> bytes:
-    # Sort by state, take top 16 for readability
     sorted_items = sorted(counts.items(), key=lambda x: -x[1])[:16]
     states = [s.replace(" ", "") for s, _ in sorted_items]
     vals   = [v for _, v in sorted_items]
@@ -176,51 +119,43 @@ def histogram_png(counts: dict, title: str = "") -> bytes:
     ax.set_facecolor("#0c1424")
 
     colors = ["#22d3ee" if p == max(probs) else "#1e3050" for p in probs]
-    bars = ax.bar(states, probs, color=colors, edgecolor="#162035",
-                  linewidth=0.5, zorder=3)
+    ax.bar(states, probs, color=colors, edgecolor="#162035", linewidth=0.5, zorder=3)
 
-    # Label top bar
     max_idx = probs.index(max(probs))
-    ax.text(max_idx, probs[max_idx] + 0.01,
-            f"{probs[max_idx]:.1%}", ha="center", va="bottom",
-            color="#22d3ee", fontsize=9, fontweight="bold",
-            fontfamily="monospace")
+    ax.text(max_idx, probs[max_idx] + 0.01, f"{probs[max_idx]:.1%}",
+            ha="center", va="bottom", color="#22d3ee", fontsize=9,
+            fontweight="bold", fontfamily="monospace")
 
     ax.set_xlabel("Measurement outcome", color="#475569", fontsize=10)
-    ax.set_ylabel("Probability", color="#475569", fontsize=10)
-    ax.set_title(title, color="#cbd5e1", fontsize=11, pad=10,
-                 fontfamily="monospace")
+    ax.set_ylabel("Probability",         color="#475569", fontsize=10)
+    ax.set_title(title, color="#cbd5e1", fontsize=11, pad=10, fontfamily="monospace")
     ax.tick_params(colors="#475569", labelsize=8)
-    ax.spines[:].set_color("#162035")
+    for spine in ax.spines.values():
+        spine.set_color("#162035")
     ax.grid(axis="y", color="#162035", linewidth=0.5, zorder=0)
     plt.xticks(rotation=45, ha="right")
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=130,
-                facecolor="#080d1a")
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=130, facecolor="#080d1a")
     plt.close("all")
     buf.seek(0)
     return buf.read()
 
-
-# ── LLM agent (minimal inline version) ────────────────────────────────────────
-try:
-    API_KEY = st.secrets["ANTHROPIC_API_KEY"]
-except Exception:
-    API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL   = "claude-sonnet-4-20250514"
+# ── LLM helpers ───────────────────────────────────────────────────────────────
+MODEL = "claude-sonnet-4-20250514"
 
 QISKIT_RULES = """
 QISKIT 2.x RULES (strictly enforce):
 - from qiskit import QuantumCircuit, transpile
 - from qiskit_aer import AerSimulator
 - DO NOT use: qiskit.execute(), Aer.get_backend(), QuantumInstance, qiskit.opflow
-- Function MUST return a QuantumCircuit with measurements applied
+- Function MUST return a QuantumCircuit with measurements applied (qc.measure_all())
 - No print statements, no plt.show(), no if __name__ blocks
 """
 
 def _llm(prompt: str, max_tokens: int = 1800) -> str:
-    client = anthropic.Anthropic(api_key=API_KEY)
+    api_key = get_api_key()
+    client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
@@ -229,7 +164,6 @@ def _llm(prompt: str, max_tokens: int = 1800) -> str:
     return msg.content[0].text
 
 def _extract_code(text: str) -> str:
-    import re
     m = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
     if m: return m.group(1).strip()
     m = re.search(r"```\s*(.*?)```", text, re.DOTALL)
@@ -237,7 +171,6 @@ def _extract_code(text: str) -> str:
     return text.strip()
 
 def _extract_json(text: str) -> dict:
-    import re, json
     m = re.search(r"```json\s*(.*?)```", text, re.DOTALL)
     raw = m.group(1).strip() if m else text.strip()
     return json.loads(raw)
@@ -249,7 +182,7 @@ Convert this natural language description into a structured quantum task.
 
 User request: {nl}
 
-Respond with JSON in ```json ... ```:
+Respond with JSON inside ```json ... ```:
 {{
   "entry_point": "snake_case_function_name",
   "complete_prompt": "from qiskit import QuantumCircuit\\ndef function_name() -> QuantumCircuit:\\n    \\\"\\\"\\\"docstring\\\"\\\"\\\"",
@@ -266,7 +199,7 @@ Implement this quantum circuit function using Qiskit 2.x.
 
 {task['complete_prompt']}
 
-Return ONLY the function in ```python ... ```.
+Return ONLY the function inside ```python ... ```.
 """
     return _extract_code(_llm(prompt))
 
@@ -282,14 +215,14 @@ Failed code:
 {code}
 ```
 
-Error/failure: {error[:500]}
+Error: {error[:500]}
 
-Return ONLY fixed code in ```python ... ```.
+Return ONLY fixed code inside ```python ... ```.
 """
     return _extract_code(_llm(prompt))
 
-def try_execute(code: str, entry_point: str) -> tuple[QuantumCircuit | None, str]:
-    """Try to exec code and return (circuit, error_message)."""
+def try_execute(code: str, entry_point: str):
+    """Returns (qc, error_str). qc is None on failure."""
     ns = {"QuantumCircuit": QuantumCircuit}
     try:
         exec(compile(code, "<gen>", "exec"), ns)
@@ -300,21 +233,98 @@ def try_execute(code: str, entry_point: str) -> tuple[QuantumCircuit | None, str
         if not isinstance(qc, QuantumCircuit):
             return None, "Function did not return a QuantumCircuit."
         if "measure" not in dict(qc.count_ops()):
-            return None, "Circuit has no measurements — add qc.measure_all()."
+            return None, "Circuit has no measurements — needs qc.measure_all()."
         return qc, ""
-    except Exception as e:
+    except Exception:
         return None, traceback.format_exc(limit=4)
 
+# ── run the full pipeline, return a plain-dict result (no QC objects) ─────────
+def run_pipeline(nl: str, max_iter: int) -> dict:
+    """
+    Runs the full generate→execute→repair loop.
+    Returns a serializable dict — NO QuantumCircuit objects stored.
+    PNG images are stored as bytes.
+    """
+    result = {
+        "nl": nl, "task": None, "code": "", "passed": False,
+        "iterations": 0, "error": "", "circuit_png": None,
+        "hist_png": None, "gate_counts": {}, "depth": 0,
+        "num_qubits": 0, "counts": None, "top_state": "",
+        "top_prob": 0.0, "num_clbits": 0, "steps": [],
+    }
+
+    def log(msg):
+        result["steps"].append(msg)
+
+    try:
+        log("Step 1 · Formulating task structure...")
+        task = formulate_task(nl)
+        result["task"] = task
+        log(f"→ {task['entry_point']}()  type: {task['algorithm_type']}")
+
+        code = ""
+        qc   = None
+        err  = ""
+
+        for iteration in range(1, max_iter + 1):
+            result["iterations"] = iteration
+
+            if iteration == 1:
+                log(f"Step 2 · Generating Qiskit code...")
+                code = generate_code(task)
+            else:
+                log(f"Step {iteration + 1} · Repairing (iter {iteration})...")
+                code = repair_code(task, code, err, iteration)
+
+            result["code"] = code
+            qc, err = try_execute(code, task["entry_point"])
+
+            if qc is not None:
+                result["passed"] = True
+                log(f"✅ Circuit executes ({qc.num_qubits} qubits, depth {qc.depth()})")
+                break
+            else:
+                log(f"❌ {err[:120].strip()}")
+
+        if not result["passed"]:
+            result["error"] = err
+            return result
+
+        # Simulate
+        log("Simulating on Qiskit-Aer...")
+        counts = run_circuit(qc)
+        result["counts"]     = counts
+        result["gate_counts"] = dict(qc.count_ops())
+        result["depth"]      = qc.depth()
+        result["num_qubits"] = qc.num_qubits
+        result["num_clbits"] = qc.num_clbits
+
+        top_state, top_count = max(counts.items(), key=lambda x: x[1])
+        result["top_state"] = top_state.replace(" ", "")
+        result["top_prob"]  = round(top_count / sum(counts.values()), 4)
+
+        # Render images
+        log("Rendering diagrams...")
+        result["circuit_png"] = circuit_png(qc)
+        result["hist_png"]    = histogram_png(
+            counts, title=f"{task['entry_point']}() · {SHOTS} shots"
+        )
+        log("Done ✅")
+
+    except Exception:
+        result["error"] = traceback.format_exc(limit=6)
+
+    return result
 
 # ── session state ──────────────────────────────────────────────────────────────
 for key, default in [
-    ("result", None),
+    ("result",  None),
     ("history", []),
     ("running", False),
+    ("prefill", ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
-
 
 # ── sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -344,161 +354,107 @@ with st.sidebar:
     ]
     for ex in examples:
         if st.button(ex, key=f"ex_{ex}"):
-            st.session_state["prefill"] = ex
+            st.session_state.prefill = ex
+            st.rerun()
 
     st.divider()
-    allowed, remaining = _check_rate_limit()
-    st.markdown(f"**Rate limit:** {remaining}/{RATE_LIMIT_MAX} runs remaining this hour")
-    if not allowed:
-        st.error("Rate limit reached. Try again in an hour.")
+    _, remaining = _check_rate_limit()
+    st.markdown(f"**Rate limit:** {remaining}/{RATE_LIMIT_MAX} runs/hour")
 
     st.divider()
     st.markdown(
         "Built on [QuanBench-44](https://arxiv.org/abs/2510.16779) · "
-        "[GitHub](https://github.com) · "
         "Qiskit 2.x + claude-sonnet-4"
     )
 
-
-# ── main ───────────────────────────────────────────────────────────────────────
+# ── main UI ────────────────────────────────────────────────────────────────────
 st.markdown(
     "<h1 style='margin-bottom:4px'>Quantum Circuit Generator</h1>"
-    "<p style='color:#475569;font-size:13px;margin-top:0'>Type any quantum algorithm in plain English. "
+    "<p style='color:#475569;font-size:13px;margin-top:0'>"
+    "Type any quantum algorithm in plain English. "
     "The agent generates, runs, and visualizes the Qiskit circuit.</p>",
     unsafe_allow_html=True,
 )
 
-# Input box — pick up prefill from sidebar buttons
-prefill = st.session_state.pop("prefill", "")
+# Capture input — use session state key so value survives reruns
 nl_input = st.text_area(
-    "Describe your quantum circuit",
-    value=prefill,
+    "prompt",
+    value=st.session_state.prefill,
     height=80,
-    placeholder='e.g. "Implement Grover search targeting |101> on a 3-qubit register"',
+    placeholder='e.g. "Grover search targeting |101> on a 3-qubit register"',
     label_visibility="collapsed",
+    key="nl_input_box",
 )
 
 col_btn, col_opts = st.columns([1, 2])
 with col_btn:
     run_btn = st.button("⚛  Generate Circuit", disabled=st.session_state.running)
 with col_opts:
-    max_iter = st.slider("Max repair iterations", 1, 5, 3, label_visibility="visible")
-
+    max_iter = st.slider("Max repair iterations", 1, 5, 3)
 
 # ── RUN ────────────────────────────────────────────────────────────────────────
-if run_btn and nl_input.strip():
+if run_btn:
+    prompt_text = st.session_state.get("nl_input_box", "").strip()
+
+    if not prompt_text:
+        st.warning("Please enter a circuit description first.")
+        st.stop()
+
     allowed, _ = _check_rate_limit()
     if not allowed:
         st.error("Rate limit reached. Try again in an hour.")
         st.stop()
 
-    if not API_KEY:
-        st.error("ANTHROPIC_API_KEY not set. Add it to your .env or Streamlit secrets.")
+    api_key = get_api_key()
+    if not api_key:
+        st.error("ANTHROPIC_API_KEY not set. Add it to Streamlit Cloud secrets.")
         st.stop()
 
     _record_run()
+    # Clear prefill so next run starts clean
+    st.session_state.prefill = ""
     st.session_state.running = True
+    st.session_state.result  = None
 
     with st.status("Running agent...", expanded=True) as status:
         t0 = time.time()
-        result = {
-            "nl": nl_input.strip(),
-            "task": None,
-            "code": "",
-            "qc": None,
-            "counts": None,
-            "passed": False,
-            "iterations": 0,
-            "error": "",
-            "circuit_png": None,
-            "hist_png": None,
-            "gate_counts": {},
-            "depth": 0,
-        }
+        result = run_pipeline(prompt_text, max_iter)
+        elapsed = time.time() - t0
 
-        try:
-            # Step 1: formulate
-            st.write("**Step 1** · Formulating task structure...")
-            task = formulate_task(nl_input.strip())
-            result["task"] = task
-            st.write(f"  → `{task['entry_point']}()` · type: `{task['algorithm_type']}`")
+        for step_msg in result["steps"]:
+            st.write(step_msg)
 
-            # Step 2+: generate → execute → repair loop
-            code = ""
-            qc   = None
-            err  = ""
+        if result["passed"]:
+            status.update(
+                label=f"✅ Done in {elapsed:.1f}s — {result['iterations']} iteration(s)",
+                state="complete",
+            )
+        else:
+            status.update(label="Agent finished — circuit could not be verified", state="error")
 
-            for iteration in range(1, max_iter + 1):
-                result["iterations"] = iteration
+    st.session_state.result  = result
+    st.session_state.running = False
 
-                if iteration == 1:
-                    st.write(f"**Step 2** · Generating Qiskit code...")
-                    code = generate_code(task)
-                else:
-                    st.write(f"**Step {iteration+1}** · Repairing (iter {iteration})...")
-                    code = repair_code(task, code, err, iteration)
-
-                result["code"] = code
-                qc, err = try_execute(code, task["entry_point"])
-
-                if qc is not None:
-                    result["passed"] = True
-                    result["qc"] = qc
-                    st.write(f"  → ✅ Circuit executes ({qc.num_qubits} qubits, depth {qc.depth()})")
-                    break
-                else:
-                    st.write(f"  → ❌ {err[:120].strip()}...")
-
-            if not result["passed"]:
-                result["error"] = err
-                status.update(label="Agent finished — circuit could not be verified", state="error")
-            else:
-                # Step: simulate
-                st.write("**Simulating** · Running on Qiskit-Aer...")
-                counts = run_circuit(qc)
-                result["counts"]     = counts
-                result["gate_counts"] = dict(qc.count_ops())
-                result["depth"]      = qc.depth()
-
-                st.write("**Rendering** · Generating diagrams...")
-                result["circuit_png"] = circuit_png(qc)
-                result["hist_png"]    = histogram_png(
-                    counts,
-                    title=f"{task['entry_point']}() · {SHOTS} shots"
-                )
-                elapsed = time.time() - t0
-                status.update(
-                    label=f"✅ Done in {elapsed:.1f}s — {iteration} iteration(s)",
-                    state="complete"
-                )
-
-        except Exception as e:
-            result["error"] = traceback.format_exc(limit=6)
-            status.update(label=f"Error: {e}", state="error")
-
-    st.session_state.result   = result
-    st.session_state.running  = False
+    # Add to history
     st.session_state.history.append({
-        "nl":       result["nl"],
+        "nl":       prompt_text,
         "passed":   result["passed"],
         "iter":     result["iterations"],
         "entry_pt": result["task"]["entry_point"] if result["task"] else "—",
         "ts":       datetime.utcnow().strftime("%H:%M:%S"),
     })
 
-
 # ── RESULTS ────────────────────────────────────────────────────────────────────
 r = st.session_state.result
 if r:
     st.divider()
 
-    # Header row
     col1, col2, col3, col4 = st.columns(4)
     badge = '<span class="pass-badge">✓ PASS</span>' if r["passed"] else '<span class="fail-badge">✗ FAIL</span>'
     col1.markdown(f"**Result** {badge}", unsafe_allow_html=True)
     col2.metric("Iterations", r["iterations"])
     if r["passed"]:
-        col3.metric("Qubits", r["qc"].num_qubits)
+        col3.metric("Qubits",        r["num_qubits"])
         col4.metric("Circuit depth", r["depth"])
 
     st.divider()
@@ -506,35 +462,33 @@ if r:
     if r["passed"]:
         tab_circ, tab_hist, tab_code, tab_stats = st.tabs([
             "⚛ Circuit Diagram", "📊 Measurement Histogram",
-            "📄 Generated Code",  "📈 Gate Statistics"
+            "📄 Generated Code",  "📈 Gate Statistics",
         ])
 
         with tab_circ:
+            entry = r["task"]["entry_point"] if r["task"] else ""
             st.markdown(
-                f"<div class='info-box'>Circuit for <code>{r['task']['entry_point']}()</code> · "
-                f"{r['qc'].num_qubits} qubits · depth {r['depth']}</div>",
-                unsafe_allow_html=True
+                f"<div class='info-box'>Circuit for <code>{entry}()</code> · "
+                f"{r['num_qubits']} qubits · depth {r['depth']}</div>",
+                unsafe_allow_html=True,
             )
             st.image(r["circuit_png"], use_container_width=True)
 
         with tab_hist:
-            total = sum(r["counts"].values())
-            top_state, top_count = max(r["counts"].items(), key=lambda x: x[1])
-            top_prob = top_count / total
             st.markdown(
                 f"<div class='info-box'>Most probable state: "
-                f"<code>|{top_state.replace(' ','')}⟩</code> "
-                f"with probability <b>{top_prob:.1%}</b> "
-                f"({SHOTS} shots · {len(r['counts'])} unique outcomes)</div>",
-                unsafe_allow_html=True
+                f"<code>|{r['top_state']}⟩</code> · "
+                f"probability <b>{r['top_prob']:.1%}</b> · "
+                f"{SHOTS} shots · {len(r['counts'])} unique outcomes</div>",
+                unsafe_allow_html=True,
             )
             st.image(r["hist_png"], use_container_width=True)
 
         with tab_code:
             st.markdown(
-                f"<div class='info-box'>Generated by claude-sonnet-4 · "
-                f"verified by Qiskit-Aer simulator</div>",
-                unsafe_allow_html=True
+                "<div class='info-box'>Generated by claude-sonnet-4 · "
+                "verified by Qiskit-Aer simulator</div>",
+                unsafe_allow_html=True,
             )
             st.code(r["code"], language="python")
 
@@ -544,19 +498,17 @@ if r:
                 col_a, col_b = st.columns(2)
                 with col_a:
                     st.markdown("**Gate counts**")
+                    max_count = max(gc.values())
                     for gate, count in sorted(gc.items(), key=lambda x: -x[1]):
-                        pct = count / max(gc.values())
-                        st.progress(pct, text=f"`{gate}` × {count}")
+                        st.progress(count / max_count, text=f"`{gate}` × {count}")
                 with col_b:
                     st.markdown("**Circuit summary**")
-                    st.metric("Total gates",   sum(v for k,v in gc.items() if k != "barrier"))
-                    st.metric("Circuit depth", r["depth"])
-                    st.metric("Qubits",        r["qc"].num_qubits)
-                    st.metric("Classical bits",r["qc"].num_clbits)
+                    st.metric("Total gates",     sum(v for k, v in gc.items() if k != "barrier"))
+                    st.metric("Circuit depth",   r["depth"])
+                    st.metric("Qubits",          r["num_qubits"])
+                    st.metric("Classical bits",  r["num_clbits"])
                     st.metric("Unique outcomes", len(r["counts"]))
-                    top_s = top_state.replace(" ","")
-                    st.metric("Top state", f"|{top_s}⟩ ({top_prob:.1%})")
-
+                    st.metric("Top state",       f"|{r['top_state']}⟩ ({r['top_prob']:.1%})")
     else:
         st.error("The agent could not produce a valid circuit within the iteration limit.")
         if r["error"]:
@@ -566,11 +518,10 @@ if r:
             with st.expander("Last generated code"):
                 st.code(r["code"], language="python")
         st.markdown(
-            "<div class='warn-box'>💡 Try rephrasing the prompt to be more specific, "
+            "<div class='warn-box'>💡 Try rephrasing the prompt more specifically, "
             "or increase the max repair iterations.</div>",
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
-
 
 # ── HISTORY ────────────────────────────────────────────────────────────────────
 if st.session_state.history:
