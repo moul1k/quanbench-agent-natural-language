@@ -204,7 +204,10 @@ def histogram_png(counts: dict, title: str = "") -> bytes:
 
 
 # ── LLM agent (minimal inline version) ────────────────────────────────────────
-API_KEY = os.environ.get("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", "")
+try:
+    API_KEY = st.secrets["ANTHROPIC_API_KEY"]
+except Exception:
+    API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL   = "claude-sonnet-4-20250514"
 
 QISKIT_RULES = """
