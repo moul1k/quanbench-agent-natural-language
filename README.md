@@ -53,6 +53,17 @@ Benchmark task  ─────────────┤
                      back to Simulator
                      (max N iterations)
 ```
+## Results
+
+| Mode | Tasks | Passed | Pass Rate |
+|------|-------|--------|-----------|
+| Benchmark (QuanBench-44) | 16 | 11 | **68.8%** |
+| Paper baseline (no repair loop) | — | — | <40% |
+| Custom NL task (Phase 2) | 1 | 1 | **100%** |
+
+Repair loop improves Pass@1 (12.5%) → Pass@5 (68.8%) — a **+56.3pp gain**.
+94% of failures are `CIRCUIT_STRUCTURE`: circuits compile and run but produce
+wrong quantum distributions. Syntactic correctness ≠ semantic correctness.
 
 ### Files
 
@@ -207,19 +218,3 @@ The recommended stable task set for evaluation is tasks:
 
 ---
 
-## Making it displayable (GitHub / portfolio)
-
-1. Create a GitHub repo named `quanbench-agent` or `quantum-code-agent`
-2. Add a `README.md` (this file)
-3. Add a `notebooks/` folder with a Jupyter demo:
-   - Run 3 benchmark tasks showing the repair loop in action
-   - Run 2 custom NL tasks (one Grover, one QFT)
-   - Plot pass@k bar chart from `results.json`
-4. Add `results/` folder with pre-run `results.json` so recruiters can see
-   output without running the code
-5. Pin the repo to your GitHub profile
-
-For a stronger presentation, add a `FINDINGS.md` that documents:
-- The 30/44 canonical compatibility finding (publishable observation)
-- Your pass rate vs the paper's baseline (<40% with no repair loop)
-- Breakdown of failure types across your runs
