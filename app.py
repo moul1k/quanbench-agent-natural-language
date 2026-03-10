@@ -74,22 +74,25 @@ h1, h2, h3 { font-family: 'Syne', sans-serif !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── rate limiter (global, session-based) ──────────────────────────────────────
+# ── rate limiter — cross-session via cache_resource ──────────────────────────
 RATE_LIMIT_MAX  = 20
 RATE_LIMIT_SECS = 3600
 
-if "rate_log" not in st.session_state:
-    st.session_state.rate_log = []
+@st.cache_resource
+def _get_global_rate_store():
+    """Shared across all sessions on this Streamlit instance."""
+    return {"log": []}
 
 def _check_rate_limit():
+    store = _get_global_rate_store()
     now = datetime.utcnow()
     cutoff = now - timedelta(seconds=RATE_LIMIT_SECS)
-    st.session_state.rate_log = [t for t in st.session_state.rate_log if t > cutoff]
-    remaining = RATE_LIMIT_MAX - len(st.session_state.rate_log)
+    store["log"] = [t for t in store["log"] if t > cutoff]
+    remaining = RATE_LIMIT_MAX - len(store["log"])
     return remaining > 0, remaining
 
 def _record_run():
-    st.session_state.rate_log.append(datetime.utcnow())
+    _get_global_rate_store()["log"].append(datetime.utcnow())
 
 # ── Qiskit helpers ─────────────────────────────────────────────────────────────
 SHOTS = 4096
@@ -100,14 +103,30 @@ def run_circuit(qc: QuantumCircuit, shots: int = SHOTS) -> dict:
     return sim.run(t, shots=shots).result().get_counts()
 
 def circuit_png(qc: QuantumCircuit) -> bytes:
-    fig = qc.draw("mpl", style="bw", fold=40)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=130, facecolor="#080d1a")
-    plt.close("all")
-    buf.seek(0)
-    return buf.read()
+    fig = None
+    try:
+        fig = qc.draw("mpl", style="bw", fold=40)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=130, facecolor="#080d1a")
+        buf.seek(0)
+        return buf.read()
+    finally:
+        plt.close("all")
 
 def histogram_png(counts: dict, title: str = "") -> bytes:
+    if not counts:
+        # Return a minimal placeholder image
+        fig, ax = plt.subplots(figsize=(6, 3))
+        fig.patch.set_facecolor("#080d1a")
+        ax.set_facecolor("#0c1424")
+        ax.text(0.5, 0.5, "No measurement results", ha="center", va="center",
+                color="#475569", fontsize=12, transform=ax.transAxes)
+        ax.axis("off")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=100, facecolor="#080d1a")
+        plt.close("all")
+        buf.seek(0)
+        return buf.read()
     sorted_items = sorted(counts.items(), key=lambda x: -x[1])[:16]
     states = [s.replace(" ", "") for s, _ in sorted_items]
     vals   = [v for _, v in sorted_items]
@@ -155,13 +174,22 @@ QISKIT 2.x RULES (strictly enforce):
 
 def _llm(prompt: str, max_tokens: int = 1800) -> str:
     api_key = get_api_key()
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text
+    client = anthropic.Anthropic(api_key=api_key, timeout=45.0)
+    try:
+        msg = client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text
+    except anthropic.RateLimitError:
+        raise RuntimeError("Anthropic API rate limit reached. Please wait a minute and try again.")
+    except anthropic.APITimeoutError:
+        raise RuntimeError("Request timed out. The model is busy — please try again.")
+    except anthropic.APIStatusError as e:
+        raise RuntimeError(f"Anthropic API error ({e.status_code}): {e.message}")
+    except Exception as e:
+        raise RuntimeError(f"LLM call failed: {e}")
 
 def _extract_code(text: str) -> str:
     m = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
@@ -173,7 +201,12 @@ def _extract_code(text: str) -> str:
 def _extract_json(text: str) -> dict:
     m = re.search(r"```json\s*(.*?)```", text, re.DOTALL)
     raw = m.group(1).strip() if m else text.strip()
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            "LLM returned malformed JSON. Try rephrasing your prompt."
+        )
 
 def formulate_task(nl: str) -> dict:
     prompt = f"""{QISKIT_RULES}
@@ -221,8 +254,32 @@ Return ONLY fixed code inside ```python ... ```.
 """
     return _extract_code(_llm(prompt))
 
+# Imports that generated code should never use
+_BLOCKED_IMPORTS = ["os", "sys", "subprocess", "socket", "shutil",
+                    "pathlib", "glob", "requests", "urllib", "http",
+                    "importlib", "builtins", "eval", "exec"]
+
+def _check_safe_code(code: str) -> str | None:
+    """Returns an error string if code contains dangerous patterns, else None."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        return None  # let exec() catch it with a better message
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.Import, _ast.ImportFrom)):
+            names = [a.name for a in node.names] if isinstance(node, _ast.Import) else [node.module or ""]
+            for name in names:
+                root = name.split(".")[0]
+                if root in _BLOCKED_IMPORTS:
+                    return f"Blocked import: '{name}' is not permitted in generated code."
+    return None
+
 def try_execute(code: str, entry_point: str):
     """Returns (qc, error_str). qc is None on failure."""
+    safety_err = _check_safe_code(code)
+    if safety_err:
+        return None, safety_err
     ns = {"QuantumCircuit": QuantumCircuit}
     try:
         exec(compile(code, "<gen>", "exec"), ns)
@@ -355,6 +412,7 @@ with st.sidebar:
     for ex in examples:
         if st.button(ex, key=f"ex_{ex}"):
             st.session_state.prefill = ex
+            st.session_state.nl_input_box = ex
             st.rerun()
 
     st.divider()
@@ -379,7 +437,6 @@ st.markdown(
 # Capture input — use session state key so value survives reruns
 nl_input = st.text_area(
     "prompt",
-    value=st.session_state.prefill,
     height=80,
     placeholder='e.g. "Grover search targeting |101> on a 3-qubit register"',
     label_visibility="collapsed",
@@ -443,6 +500,8 @@ if run_btn:
         "entry_pt": result["task"]["entry_point"] if result["task"] else "—",
         "ts":       datetime.utcnow().strftime("%H:%M:%S"),
     })
+    # Cap history to prevent unbounded memory growth
+    st.session_state.history = st.session_state.history[-50:]
 
 # ── RESULTS ────────────────────────────────────────────────────────────────────
 r = st.session_state.result
